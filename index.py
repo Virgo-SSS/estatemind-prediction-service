@@ -1,61 +1,98 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import pandas as pd
+from typing import List
+from statsmodels.tsa.exponential_smoothing.ets import ETSModel
+from statsmodels.tsa.exponential_smoothing.ets import ETSResults
+from sklearn.metrics import mean_absolute_percentage_error
+import matplotlib.pyplot as plt
+from statsmodels.tsa.stattools import acf
+import pandas as pd
+from typing import *
+
 
 app = FastAPI()
 
-dummy_data = [
-    {"date": "2023-01", "quantity": 1},
-    {"date": "2023-02", "quantity": 20},
-    {"date": "2023-03", "quantity": 8},
-    {"date": "2023-04", "quantity": 4},
-    {"date": "2023-05", "quantity": 5},
-    {"date": "2023-06", "quantity": 60},
-    {"date": "2023-07", "quantity": 7},
-    {"date": "2023-08", "quantity": 2},
-    {"date": "2023-09", "quantity": 30},
-    {"date": "2023-10", "quantity": 12},
-    {"date": "2023-11", "quantity": 11},
-    {"date": "2023-12", "quantity": 12},
-    {"date": "2024-01", "quantity": 13},
-    {"date": "2024-02", "quantity": 14},
-    {"date": "2024-03", "quantity": 21},
-    {"date": "2024-04", "quantity": 15},
-    {"date": "2024-05", "quantity": 17},
-    {"date": "2024-06", "quantity": 10},
-    {"date": "2024-07", "quantity": 1},
-    {"date": "2024-08", "quantity": 2},
-    {"date": "2024-09", "quantity": 21},
-    {"date": "2024-10", "quantity": 22},
-    {"date": "2024-11", "quantity": 23},
-    {"date": "2024-12", "quantity": 23},
-    {"date": "2025-01", "quantity": 22},
-    {"date": "2025-02", "quantity": 26},
-    {"date": "2025-03", "quantity": 11},
-    {"date": "2025-04", "quantity": 8},
-    {"date": "2025-05", "quantity": 9},
-    {"date": "2025-06", "quantity": 3},
-]
-
-alpha: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-beta: list[float | None] = [None, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-gamma: list[float | None] = [None, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-
-seasonal_periods = 4
-
-class Item(BaseModel):
+class Sale(BaseModel):
     date: str
     quantity: int
 
-class Sales(BaseModel):
-    sales: list[Item] = dummy_data
+class PredictRequest(BaseModel):
+    sales: List[Sale]
+    period: int
 
-@app.get("/predict")
-def predict(sales: Sales):
-    series = pd.Series([item['quantity'] for item in sales.sales], index=pd.to_datetime([item['date'] for item in sales.sales]))
+additive_configs = [
+    {'error': 'add', 'trend': None, 'seasonal': None, 'damped_trend': False},
+    {'error': 'add', 'trend': None, 'seasonal': 'add', 'damped_trend': False},
+    {'error': 'add', 'trend': 'add', 'seasonal': None, 'damped_trend': False},
+    {'error': 'add', 'trend': 'add', 'seasonal': None, 'damped_trend': True},
+    {'error': 'add', 'trend': 'add', 'seasonal': 'add', 'damped_trend': False},
+    {'error': 'add', 'trend': 'add', 'seasonal': 'add', 'damped_trend': True},
+]
+
+@app.post("/predict")
+def predict(request: PredictRequest):
+
+    # Load and preprocess
+    df = pd.DataFrame(sale.model_dump() for sale in request.sales)
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+    df = df.asfreq('MS')
+
+    df_train = df[:-3]
+    df_test = df[-3:]
+
+    # Use the Series, not flattened NumPy array
+    df_train_one_d = df_train["quantity"]
+    df_test_one_d = df_test["quantity"]
+  
+    # start find best model configurations
+    best_mape = float("inf")
+    best_model = None
+    y_pred = None
+
+    for config in additive_configs:  # or valid_configs if you want to include multiplicative
+        try:
+            model = ETSModel(
+                endog=df_train_one_d, 
+                error=config["error"], 
+                trend=config["trend"], 
+                seasonal=config["seasonal"],
+                damped_trend=config["damped_trend"], 
+                seasonal_periods=12,
+                initialization_method="estimated",
+            )
+
+
+            fit = model.fit(maxiter=100000)
+            y_pred = fit.predict(start=df_test_one_d.index[0], end=df_test_one_d.index[-1])
+            print(f"Config: {config}, MAPE: {mean_absolute_percentage_error(df_test_one_d, y_pred)}")
+
+            mape = mean_absolute_percentage_error(df_test_one_d, y_pred)
+
+            if mape < best_mape:
+                best_mape = mape
+                best_model = fit
+            
+        except Exception as e:
+            print(f"Error with config {config}: {e}")
     
+
+    if best_model is None:
+        return {"error": "No suitable model found for the provided sales data."}
+
+    latest_date = df.index[-1]
+    future_dates = pd.date_range(start=latest_date + pd.DateOffset(months=1), 
+                                  periods=request.period, freq='MS')
     
+    future_predictions = best_model.predict(start=future_dates[0], end=future_dates[-1])
+    predictions_df = pd.DataFrame({
+        'date': future_dates,
+        'total': future_predictions
+    })
+    predictions_df.set_index('date', inplace=True)
+    predictions_list = predictions_df.reset_index().to_dict(orient='records')
 
-
-    return {"predicted_sales": [100, 200, 300]}
-
+    return {
+        "predictions": predictions_list
+    }
